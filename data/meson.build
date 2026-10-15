@@ -8,7 +8,7 @@ install_data(
 )
 install_data(
   'x-cinnamon-portals.conf',
-  install_dir: datadir / 'xdg-desktop-portal'
+  install_dir: get_option('sysconfdir') / 'xdg' / 'xdg-desktop-portal'
 )
 install_data(
   '50-lindm-native-selection.conf',
