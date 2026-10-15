@@ -28,3 +28,11 @@ Remote input is accepted only after consent and successful startup, only for
 the granted device types and, for absolute motion, only for a node belonging
 to the session. Permissions are not persisted. Touch input and libei are not
 advertised.
+
+The interactive native regression test is
+`python3 src/screencast/test-remote-desktop.py` inside Cinnamon X11. Accept
+control and select a monitor in the real dialogs. It decodes PipeWire frames,
+checks real GTK keyboard/pointer delivery after 35 seconds, and checks held
+input release and rejection after closing the session. Repeat with `--decline`,
+`--cancel`, `--stop`, and `--lock` for the local refusal and teardown paths.
+The test requires PyGObject, GTK 3, GStreamer and `gstreamer1.0-pipewire`.
