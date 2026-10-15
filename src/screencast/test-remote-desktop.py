@@ -4,12 +4,13 @@
 Requires PyGObject, GTK 3, GStreamer and gstreamer1.0-pipewire. No private
 compositor APIs are used. --decline expects the local Cancel button;
 --cancel closes the public pending request; --lock expects loginctl lock-session;
---stop expects the local Stop sharing button; --backend-loss expects the actual
-backend process to exit. --client-loss disconnects this public portal client.
+--stop expects the local Stop sharing button or indicator window close;
+--backend-loss expects the actual backend process to exit; --client-loss disconnects this public portal client.
 --view-only tests ScreenCast without input; --window tests selected-window capture.
 Default: close the public session.
 """
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -45,7 +46,7 @@ session = None
 pipeline = None
 pipewire_fd = None
 closed = []
-released = {'shift': 0, 'button': 0, 'keysym': 0}
+released = {'shift': 0, 'button': 0, 'keysym': 0, 'focus': 0}
 held_keysym = 0x0101F4A1  # U+1F4A1 exercises a dynamically reserved XKB mapping.
 scrolls = []
 status = 1
@@ -134,12 +135,31 @@ box.pack_start(area, True, True, 0)
 window.connect('key-release-event', lambda widget, event: released.update(
     shift=released['shift'] + (event.keyval == Gdk.KEY_Shift_L),
     keysym=released['keysym'] + (event.keyval == held_keysym)))
+window.connect('focus-out-event', lambda widget, event: released.update(focus=released['focus'] + 1))
 window.show_all()
+
+
+# Read-only X-server state remains authoritative when local consent/lock UI
+# legitimately takes keyboard focus away from the GTK witness.
+x11 = ctypes.CDLL('libX11.so.6')
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+x11.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+
+def x11_keymap(display):
+    state = ctypes.create_string_buffer(32)
+    assert x11.XQueryKeymap(display, state), 'Could not read X-server keyboard state'
+    return state.raw
 
 
 def run():
     global session, pipeline, pipewire_fd, status, bus
+    xdisplay = None
     try:
+        xdisplay = x11.XOpenDisplay(None)
+        assert xdisplay, 'Could not open the actual X11 witness display'
         result, data = request(cast if args.view_only else remote, 'CreateSession', '(a{sv})',
                                (options(session_handle_token=GLib.Variant('s', 's' + uuid.uuid4().hex)),))
         assert result == 0, data
@@ -227,6 +247,7 @@ def run():
         record('native-control-verified', keyboard=entry.get_text(), clicks=released['button'],
                scrolls=scrolls, lifetime_seconds=35)
         before = dict(released)
+        before_keys = x11_keymap(xdisplay)
         notify('NotifyKeyboardKeysym', 'iu', held_keysym, 1)
         spin(200)
         assert entry.get_text().endswith('\U0001f4a1'), 'Reserved keysym did not reach native GTK'
@@ -255,12 +276,15 @@ def run():
         deadline = time.monotonic() + 5
         while True:
             _, _, _, modifiers = Gdk.get_default_root_window().get_device_position(pointer)
-            if not modifiers & held_mask or time.monotonic() >= deadline:
+            keys_released = x11_keymap(xdisplay) == before_keys
+            if (keys_released and not modifiers & held_mask) or time.monotonic() >= deadline:
                 break
             spin(50)
         assert not modifiers & held_mask, 'Held input remains in the X server after teardown'
-        # Locking changes event routing, so only assert widget delivery when unlocked.
-        if not args.lock:
+        assert keys_released, 'Held keyboard keys remain in the X server after teardown'
+        # Widget delivery is an additional oracle only if focus routing stayed
+        # unchanged. Global X-server state above is required in every mode.
+        if not args.lock and released['focus'] == before['focus']:
             assert released['shift'] > before['shift'], 'Held Shift was not released'
             assert released['button'] > before['button'], 'Held pointer button was not released'
             assert released['keysym'] > before['keysym'], 'Held reserved keysym was not released'
@@ -271,7 +295,7 @@ def run():
         else:
             raise AssertionError('Input accepted after session teardown')
         record('passed', lock=args.lock, local_stop=args.stop, backend_loss=args.backend_loss,
-               client_loss=args.client_loss, releases=released)
+               client_loss=args.client_loss, releases=released, x11_keys_released=True)
         status = 0
     except Exception as error:
         record('failed', error=str(error))
@@ -285,6 +309,8 @@ def run():
                 call('org.freedesktop.portal.Session', 'Close', '()', (), session)
             except GLib.Error:
                 pass
+        if xdisplay:
+            x11.XCloseDisplay(xdisplay)
         Gtk.main_quit()
     return False
 

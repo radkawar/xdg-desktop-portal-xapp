@@ -43,6 +43,17 @@ the test backend after the test reports that it is ready. Use `--view-only`
 and `--window` to exercise ScreenCast-only and selected-window capture.
 The test requires PyGObject, GTK 3, GStreamer and `gstreamer1.0-pipewire`.
 
+`test-muffin-x11-input.py` is a separate component regression for current
+development Muffin. Run it with `dbus-run-session -- xvfb-run -a`, never on
+the user's display. Set `LINDM_ISOLATED_X11_TEST=1`, `LD_LIBRARY_PATH` and
+`GI_TYPELIB_PATH` to that build's Muffin, Clutter and Cogl directories;
+pass `--muffin-library /absolute/build/src/libmuffin.so.0` and one of
+`--case evdev`, `--case scroll` or `--case dispose`. It uses the normal
+Clutter seat factory, reads actual X-server state/events, and fails on
+wrong evdev translation, discarded smooth scrolling, unreleased input or
+unreturned reserved keycodes. This isolated component test does not replace
+the public portal consent and assistance test above.
+
 The fork-only native package also installs a standard Cinnamon `portals.conf`
 selecting this backend and a frontend systemd drop-in limiting portal search
 homes/directories to root-controlled `/etc/xdg` and `/usr/share`. This lets the
