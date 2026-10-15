@@ -94,6 +94,7 @@ typedef struct _MuffinScreenCastSession
   char *path;
   OrgCinnamonMuffinScreenCastSession *proxy;
   gulong closed_handler_id;
+  guint owner_watch;
   gboolean closed;
 
   GList *streams;
@@ -269,7 +270,7 @@ muffin_screen_cast_session_add_stream (MuffinScreenCastSession *session,
   stream_proxy =
     org_cinnamon_muffin_screen_cast_stream_proxy_new_sync (connection,
                                                            G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
-                                                           "org.cinnamon.Muffin.ScreenCast",
+                                                           g_dbus_proxy_get_name (G_DBUS_PROXY (session->proxy)),
                                                            stream_path,
                                                            NULL,
                                                            error);
@@ -410,6 +411,8 @@ muffin_screen_cast_session_finalize (GObject *object)
 {
   MuffinScreenCastSession *session = (MuffinScreenCastSession *)object;
 
+  if (session->owner_watch)
+    g_bus_unwatch_name (session->owner_watch);
   g_list_free_full (session->streams, g_object_unref);
   g_clear_object (&session->proxy);
   g_free (session->path);
@@ -449,8 +452,18 @@ static void
 on_muffin_session_closed (OrgCinnamonMuffinScreenCastSession *session_proxy,
                           MuffinScreenCastSession *session)
 {
+  if (session->closed)
+    return;
   session->closed = TRUE;
   g_signal_emit (session, session_signals[SESSION_SIGNAL_CLOSED], 0);
+}
+
+static void
+on_compositor_vanished (GDBusConnection *connection,
+                       const char *name,
+                       gpointer data)
+{
+  on_muffin_session_closed (NULL, data);
 }
 
 MuffinScreenCastSession *
@@ -488,7 +501,7 @@ muffin_screen_cast_create_session (MuffinScreenCast *screen_cast,
   session_proxy =
     org_cinnamon_muffin_screen_cast_session_proxy_new_sync (connection,
                                                             G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
-                                                            "org.cinnamon.Muffin.ScreenCast",
+                                                            g_dbus_proxy_get_name (G_DBUS_PROXY (screen_cast->proxy)),
                                                             session_path,
                                                             NULL,
                                                             error);
@@ -502,6 +515,11 @@ muffin_screen_cast_create_session (MuffinScreenCast *screen_cast,
     g_signal_connect (session->proxy,
                       "closed", G_CALLBACK (on_muffin_session_closed),
                       session);
+  session->owner_watch =
+    g_bus_watch_name_on_connection (connection,
+                                    g_dbus_proxy_get_name (G_DBUS_PROXY (session->proxy)),
+                                    G_BUS_NAME_WATCHER_FLAGS_NONE, NULL,
+                                    on_compositor_vanished, session, NULL);
 
   return session;
 }
@@ -518,7 +536,7 @@ muffin_screen_cast_name_appeared (GDBusConnection *connection,
   screen_cast->proxy =
     org_cinnamon_muffin_screen_cast_proxy_new_sync (connection,
                                                     G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
-                                                    "org.cinnamon.Muffin.ScreenCast",
+                                                    name_owner,
                                                     "/org/cinnamon/Muffin/ScreenCast",
                                                     NULL,
                                                     &error);

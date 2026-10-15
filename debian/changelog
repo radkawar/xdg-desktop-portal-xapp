@@ -1,3 +1,10 @@
+xdg-desktop-portal-xapp (1.1.4+lindm.rd.2) zena; urgency=medium
+
+  * Bind capture, remote input and lock monitoring to unique D-Bus owners.
+  * Cover public cancellation, view/window capture and peer-loss teardown.
+
+ -- radkawar <radkawar28@gmail.com>  Thu, 15 Oct 2026 19:07:59 +0100
+
 xdg-desktop-portal-xapp (1.1.4+lindm.rd.1) zena; urgency=medium
 
   * Fork-only native Mint build: consented Muffin ScreenCast and RemoteDesktop.

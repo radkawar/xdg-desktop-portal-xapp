@@ -439,6 +439,8 @@ typedef struct _ScreenCastSession
   char *owner;
   char *app_id;
   guint owner_watch;
+  guint locker_watch;
+  guint remote_watch;
   GHashTable *pressed_keys;
   GHashTable *pressed_keysyms;
   GHashTable *pressed_buttons;
@@ -530,6 +532,10 @@ screencast_session_finalize (GObject *object)
   g_clear_object (&screencast_session->muffin_session);
   if (screencast_session->owner_watch)
     g_bus_unwatch_name (screencast_session->owner_watch);
+  if (screencast_session->locker_watch)
+    g_bus_unwatch_name (screencast_session->locker_watch);
+  if (screencast_session->remote_watch)
+    g_bus_unwatch_name (screencast_session->remote_watch);
   g_clear_object (&screencast_session->locker);
   g_free (screencast_session->owner);
   g_free (screencast_session->app_id);
@@ -1383,15 +1389,7 @@ on_lock_properties_changed (GDBusProxy *proxy, GVariant *changed, const char * c
 }
 
 static void
-on_service_owner_changed (GObject *object, GParamSpec *pspec, gpointer data)
-{
-  g_autofree char *owner = g_dbus_proxy_get_name_owner (G_DBUS_PROXY (object));
-  if (!owner)
-    terminate_sharing (data);
-}
-
-static void
-on_frontend_vanished (GDBusConnection *connection, const char *name, gpointer data)
+on_session_peer_vanished (GDBusConnection *connection, const char *name, gpointer data)
 {
   terminate_sharing (data);
 }
@@ -1405,6 +1403,7 @@ setup_session (ScreenCastSession *session, GDBusMethodInvocation *invocation,
   g_autoptr(GDBusProxy) user = NULL;
   g_autoptr(GVariant) reply = NULL;
   g_autoptr(GVariant) display = NULL;
+  g_autofree char *locker_owner = NULL;
   const char *user_path, *session_id, *session_path;
   session->owner = g_strdup (g_dbus_method_invocation_get_sender (invocation));
   session->app_id = g_strdup (app_id);
@@ -1423,6 +1422,12 @@ setup_session (ScreenCastSession *session, GDBusMethodInvocation *invocation,
                                 NULL, error);
   if (!user)
     return FALSE;
+  locker_owner = g_dbus_proxy_get_name_owner (user);
+  if (!locker_owner)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_CLOSED, "Login manager disappeared");
+      return FALSE;
+    }
   display = g_dbus_proxy_get_cached_property (user, "Display");
   if (!display)
     return FALSE;
@@ -1435,16 +1440,18 @@ setup_session (ScreenCastSession *session, GDBusMethodInvocation *invocation,
   session->locker = g_dbus_proxy_new_sync (system_bus,
                                           G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START |
                                           G_DBUS_PROXY_FLAGS_GET_INVALIDATED_PROPERTIES, NULL,
-                                          "org.freedesktop.login1", session_path,
+                                          locker_owner, session_path,
                                           "org.freedesktop.login1.Session", NULL, error);
   if (!session->locker)
     return FALSE;
   g_signal_connect (session->locker, "g-signal", G_CALLBACK (on_locker_signal), session);
   g_signal_connect (session->locker, "g-properties-changed", G_CALLBACK (on_lock_properties_changed), session);
-  g_signal_connect (session->locker, "notify::g-name-owner", G_CALLBACK (on_service_owner_changed), session);
+  session->locker_watch = g_bus_watch_name_on_connection (system_bus, locker_owner,
+                                                          G_BUS_NAME_WATCHER_FLAGS_NONE, NULL,
+                                                          on_session_peer_vanished, session, NULL);
   session->owner_watch = g_bus_watch_name_on_connection (connection, session->owner,
                                                          G_BUS_NAME_WATCHER_FLAGS_NONE, NULL,
-                                                         on_frontend_vanished, session, NULL);
+                                                         on_session_peer_vanished, session, NULL);
   return TRUE;
 }
 
@@ -1525,8 +1532,19 @@ create_remote_session (ScreenCastSession *session, GDBusConnection *connection, 
 {
   g_autoptr(GVariant) reply = NULL;
   g_autoptr(GVariant) id = NULL;
+  g_autoptr(GVariant) owner_reply = NULL;
+  const char *compositor_owner;
   const char *path;
-  reply = g_dbus_connection_call_sync (connection, "org.cinnamon.Muffin.RemoteDesktop",
+  owner_reply = g_dbus_connection_call_sync (connection, "org.freedesktop.DBus",
+                                             "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                             "GetNameOwner",
+                                             g_variant_new ("(s)", "org.cinnamon.Muffin.RemoteDesktop"),
+                                             G_VARIANT_TYPE ("(s)"), G_DBUS_CALL_FLAGS_NONE,
+                                             5000, NULL, error);
+  if (!owner_reply)
+    return FALSE;
+  g_variant_get (owner_reply, "(&s)", &compositor_owner);
+  reply = g_dbus_connection_call_sync (connection, compositor_owner,
                                        "/org/cinnamon/Muffin/RemoteDesktop",
                                        "org.cinnamon.Muffin.RemoteDesktop", "CreateSession", NULL,
                                        G_VARIANT_TYPE ("(o)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL, error);
@@ -1534,7 +1552,7 @@ create_remote_session (ScreenCastSession *session, GDBusConnection *connection, 
     return FALSE;
   g_variant_get (reply, "(&o)", &path);
   session->remote_proxy = g_dbus_proxy_new_sync (connection, G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
-                                                NULL, "org.cinnamon.Muffin.RemoteDesktop", path,
+                                                NULL, compositor_owner, path,
                                                 "org.cinnamon.Muffin.RemoteDesktop.Session", NULL, error);
   if (!session->remote_proxy)
     return FALSE;
@@ -1546,7 +1564,9 @@ create_remote_session (ScreenCastSession *session, GDBusConnection *connection, 
     }
   session->remote_id = g_variant_dup_string (id, NULL);
   g_signal_connect (session->remote_proxy, "g-signal", G_CALLBACK (on_remote_signal), session);
-  g_signal_connect (session->remote_proxy, "notify::g-name-owner", G_CALLBACK (on_service_owner_changed), session);
+  session->remote_watch = g_bus_watch_name_on_connection (connection, compositor_owner,
+                                                          G_BUS_NAME_WATCHER_FLAGS_NONE, NULL,
+                                                          on_session_peer_vanished, session, NULL);
   return TRUE;
 }
 

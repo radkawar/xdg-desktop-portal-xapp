@@ -244,6 +244,15 @@ def run():
             call('org.freedesktop.portal.Session', 'Close', '()', (), session)
             spin(500)
         assert closed or not (args.lock or args.stop or args.backend_loss), 'No Closed signal after local stop'
+        pointer = Gdk.Display.get_default().get_default_seat().get_pointer()
+        held_mask = Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.BUTTON1_MASK
+        deadline = time.monotonic() + 5
+        while True:
+            _, _, _, modifiers = Gdk.get_default_root_window().get_device_position(pointer)
+            if not modifiers & held_mask or time.monotonic() >= deadline:
+                break
+            spin(50)
+        assert not modifiers & held_mask, 'Held input remains in the X server after teardown'
         # Locking changes event routing, so only assert widget delivery when unlocked.
         if not args.lock:
             assert released['shift'] > before['shift'], 'Held Shift was not released'

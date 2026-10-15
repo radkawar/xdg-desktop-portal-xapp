@@ -28,6 +28,9 @@ Remote input is accepted only after consent and successful startup, only for
 the granted device types and, for absolute motion, only for a node belonging
 to the session. Permissions are not persisted. Touch input and libei are not
 advertised.
+Compositor sessions/streams and the logind monitor are bound to the original
+unique D-Bus owners. Owner replacement ends sharing rather than moving input,
+capture, or the lock monitor to a replacement process.
 
 The interactive native regression test is
 `python3 src/screencast/test-remote-desktop.py` inside Cinnamon X11. Accept
