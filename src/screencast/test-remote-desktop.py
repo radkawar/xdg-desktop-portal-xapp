@@ -4,7 +4,10 @@
 Requires PyGObject, GTK 3, GStreamer and gstreamer1.0-pipewire. No private
 compositor APIs are used. --decline expects the local Cancel button;
 --cancel closes the public pending request; --lock expects loginctl lock-session;
---stop expects the local Stop sharing button. Default: close the public session.
+--stop expects the local Stop sharing button; --backend-loss expects the actual
+backend process to exit. --client-loss disconnects this public portal client.
+--view-only tests ScreenCast without input; --window tests selected-window capture.
+Default: close the public session.
 """
 import argparse
 import hashlib
@@ -22,10 +25,15 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gdk, Gio, GLib, Gst, Gtk
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--decline', action='store_true')
-parser.add_argument('--cancel', action='store_true')
-parser.add_argument('--lock', action='store_true')
-parser.add_argument('--stop', action='store_true')
+mode = parser.add_mutually_exclusive_group()
+mode.add_argument('--decline', action='store_true')
+mode.add_argument('--cancel', action='store_true')
+mode.add_argument('--lock', action='store_true')
+mode.add_argument('--stop', action='store_true')
+mode.add_argument('--backend-loss', action='store_true')
+mode.add_argument('--client-loss', action='store_true')
+mode.add_argument('--view-only', action='store_true')
+mode.add_argument('--window', action='store_true')
 args = parser.parse_args()
 Gst.init(None)
 bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -74,7 +82,7 @@ def request(interface, method, signature, values, cancel=False):
         record('request', method=method, handle=handle)
         if cancel:
             call('org.freedesktop.portal.Request', 'Close', '()', (), handle)
-            return 1, {}
+            return None, {}  # Request.Close deliberately has no Response signal.
         deadline = GLib.timeout_add_seconds(120, lambda: (loop.quit(), False)[1])
         while handle not in responses:
             loop.run()
@@ -127,27 +135,41 @@ window.show_all()
 
 
 def run():
-    global session, pipeline, pipewire_fd, status
+    global session, pipeline, pipewire_fd, status, bus
     try:
-        result, data = request(remote, 'CreateSession', '(a{sv})',
+        result, data = request(cast if args.view_only else remote, 'CreateSession', '(a{sv})',
                                (options(session_handle_token=GLib.Variant('s', 's' + uuid.uuid4().hex)),))
         assert result == 0, data
         session = data['session_handle']
         bus.signal_subscribe(name, 'org.freedesktop.portal.Session', 'Closed', session,
                              None, Gio.DBusSignalFlags.NONE,
                              lambda *signal: closed.append(True))
-        assert request(remote, 'SelectDevices', '(oa{sv})',
-                       (session, options(types=GLib.Variant('u', 3))))[0] == 0
+        if not args.view_only:
+            assert request(remote, 'SelectDevices', '(oa{sv})',
+                           (session, options(types=GLib.Variant('u', 3))))[0] == 0
         assert request(cast, 'SelectSources', '(oa{sv})',
-                       (session, options(types=GLib.Variant('u', 1), multiple=GLib.Variant('b', False))))[0] == 0
+                       (session, options(types=GLib.Variant('u', 2 if args.window else 1),
+                                         multiple=GLib.Variant('b', False),
+                                         cursor_mode=GLib.Variant('u', 2))))[0] == 0
         record('local-consent-required')
-        result, data = request(remote, 'Start', '(osa{sv})', (session, '', options()), args.cancel)
+        result, data = request(cast if args.view_only else remote, 'Start', '(osa{sv})',
+                               (session, '', options()), args.cancel)
         if args.cancel or args.decline:
-            assert result != 0, 'Consent was not denied'
-            record('consent-denied', cancellation=args.cancel)
+            assert result is None if args.cancel else result == 1, 'Consent was not cancelled'
+            spin(500)
+            assert closed, 'Pending consent cancellation did not close the session'
+            try:
+                notify('NotifyKeyboardKeysym', 'iu', ord('x'), 1)
+            except GLib.Error:
+                record('input-rejected-after-denial')
+            else:
+                raise AssertionError('Input accepted without consent')
+            record('consent-denied', cancellation=args.cancel, closed=True)
             status = 0
             return False
-        assert result == 0 and data['devices'] == 3, data
+        assert result == 0, data
+        if not args.view_only:
+            assert data['devices'] == 3, data
         node = data['streams'][0][0]
         reply, descriptors = bus.call_with_unix_fd_list_sync(
             name, path, cast, 'OpenPipeWireRemote', GLib.Variant('(oa{sv})', (session, {})),
@@ -156,6 +178,12 @@ def run():
         pipeline = Gst.parse_launch('pipewiresrc fd=%d path=%d do-timestamp=true ! videoconvert ! video/x-raw,format=RGB ! appsink name=frames max-buffers=1 drop=true' % (pipewire_fd, node))
         pipeline.set_state(Gst.State.PLAYING)
         first = sample_hash()
+        if args.view_only or args.window:
+            assert data['streams'][0][1]['source_type'] == (2 if args.window else 1), data
+            call('org.freedesktop.portal.Session', 'Close', '()', (), session)
+            record('capture-passed', view_only=args.view_only, window=args.window)
+            status = 0
+            return False
         # The screensaver exits normally after 30 seconds. Sharing must survive.
         spin(35000)
         assert not closed, 'Sharing ended when the idle screensaver exited'
@@ -199,15 +227,23 @@ def run():
         notify('NotifyKeyboardKeycode', 'iu', 42, 1)  # Leave Shift held until teardown.
         notify('NotifyPointerButton', 'iu', 272, 1)
         spin(200)
-        if args.lock or args.stop:
-            record('awaiting-local-stop', lock=args.lock)
+        if args.lock or args.stop or args.backend_loss:
+            record('awaiting-local-stop', lock=args.lock, backend_loss=args.backend_loss)
             deadline = time.monotonic() + 90
             while not closed and time.monotonic() < deadline:
                 spin(100)
+        elif args.client_loss:
+            bus.set_exit_on_close(False)
+            bus.close_sync(None)
+            spin(500)
+            bus = Gio.DBusConnection.new_for_address_sync(
+                os.environ['DBUS_SESSION_BUS_ADDRESS'],
+                Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+                None, None)
         else:
             call('org.freedesktop.portal.Session', 'Close', '()', (), session)
             spin(500)
-        assert closed or not (args.lock or args.stop), 'No Closed signal after local stop'
+        assert closed or not (args.lock or args.stop or args.backend_loss), 'No Closed signal after local stop'
         # Locking changes event routing, so only assert widget delivery when unlocked.
         if not args.lock:
             assert released['shift'] > before['shift'], 'Held Shift was not released'
@@ -218,7 +254,8 @@ def run():
             record('input-rejected-after-close')
         else:
             raise AssertionError('Input accepted after session teardown')
-        record('passed', lock=args.lock, local_stop=args.stop, releases=released)
+        record('passed', lock=args.lock, local_stop=args.stop, backend_loss=args.backend_loss,
+               client_loss=args.client_loss, releases=released)
         status = 0
     except Exception as error:
         record('failed', error=str(error))

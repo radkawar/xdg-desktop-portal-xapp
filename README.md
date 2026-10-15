@@ -34,7 +34,10 @@ The interactive native regression test is
 control and select a monitor in the real dialogs. It decodes PipeWire frames,
 checks real GTK keyboard/pointer delivery after 35 seconds, and checks held
 input release and rejection after closing the session. Repeat with `--decline`,
-`--cancel`, `--stop`, and `--lock` for the local refusal and teardown paths.
+`--cancel`, `--stop`, `--lock`, `--client-loss`, and `--backend-loss` for refusal
+and teardown paths. The backend-loss case requires an operator to terminate
+the test backend after the test reports that it is ready. Use `--view-only`
+and `--window` to exercise ScreenCast-only and selected-window capture.
 The test requires PyGObject, GTK 3, GStreamer and `gstreamer1.0-pipewire`.
 
 The fork-only native package also installs a standard Cinnamon `portals.conf`
