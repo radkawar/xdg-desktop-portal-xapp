@@ -1648,8 +1648,10 @@ request_remote_consent (ScreenCastSession *session, GDBusMethodInvocation *invoc
   gtk_dialog_add_buttons (GTK_DIALOG (session->consent), _("Cancel"), GTK_RESPONSE_CANCEL,
                            _("Allow control"), GTK_RESPONSE_ACCEPT, NULL);
   gtk_dialog_set_default_response (GTK_DIALOG (session->consent), GTK_RESPONSE_CANCEL);
+  gtk_window_set_title (GTK_WINDOW (session->consent), _("Remote desktop control"));
   g_signal_connect (session->consent, "response", G_CALLBACK (on_remote_consent), consent);
-  gtk_widget_show (session->consent);
+  gtk_widget_show_all (session->consent);
+  gtk_window_present (GTK_WINDOW (session->consent));
 }
 
 static void
