@@ -30,6 +30,7 @@ typedef struct _MuffinScreenCastSession MuffinScreenCastSession;
 MuffinScreenCast *muffin_screen_cast_new (GDBusConnection *connection);
 
 MuffinScreenCastSession *muffin_screen_cast_create_session (MuffinScreenCast *screen_cast,
+                                                            const char *remote_desktop_id,
                                                             GError **error);
 
 gboolean muffin_screen_cast_session_record_monitor (MuffinScreenCastSession *session,
@@ -54,3 +55,6 @@ void muffin_screen_cast_session_abort (MuffinScreenCastSession *session);
 
 void muffin_screen_cast_session_add_stream_properties (MuffinScreenCastSession *session,
                                                        GVariantBuilder *streams_builder);
+
+const char *muffin_screen_cast_session_stream_path (MuffinScreenCastSession *session,
+                                                   guint32 node_id);

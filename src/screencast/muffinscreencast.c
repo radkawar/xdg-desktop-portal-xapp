@@ -210,6 +210,21 @@ muffin_screen_cast_session_add_stream_properties (MuffinScreenCastSession *sessi
     }
 }
 
+const char *
+muffin_screen_cast_session_stream_path (MuffinScreenCastSession *session,
+                                        guint32 node_id)
+{
+  GList *l;
+
+  for (l = session->streams; l; l = l->next)
+    {
+      MuffinScreenCastStream *stream = l->data;
+      if (stream->pipewire_node_id == node_id)
+        return stream->path;
+    }
+  return NULL;
+}
+
 static guint32
 cursor_mode_to_muffin_cursor_mode (ScreenCastCursorMode cursor_mode)
 {
@@ -440,6 +455,7 @@ on_muffin_session_closed (OrgCinnamonMuffinScreenCastSession *session_proxy,
 
 MuffinScreenCastSession *
 muffin_screen_cast_create_session (MuffinScreenCast *screen_cast,
+                                   const char *remote_desktop_id,
                                    GError **error)
 {
   GVariantBuilder properties_builder;
@@ -457,6 +473,9 @@ muffin_screen_cast_create_session (MuffinScreenCast *screen_cast,
     }
 
   g_variant_builder_init (&properties_builder, G_VARIANT_TYPE_VARDICT);
+  if (remote_desktop_id)
+    g_variant_builder_add (&properties_builder, "{sv}", "remote-desktop-session-id",
+                           g_variant_new_string (remote_desktop_id));
   properties = g_variant_builder_end (&properties_builder);
   if (!org_cinnamon_muffin_screen_cast_call_create_session_sync (screen_cast->proxy,
                                                                  properties,

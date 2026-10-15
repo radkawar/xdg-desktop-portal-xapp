@@ -426,6 +426,22 @@ typedef struct _ScreenCastSession
   MuffinScreenCastSession *muffin_session;
   gboolean started;
   gboolean start_pending;
+  gboolean remote;
+  gboolean sources_selected;
+  gboolean unlocked;
+  guint32 devices;
+  GDBusProxy *remote_proxy;
+  char *remote_id;
+  GDBusProxy *locker;
+  GtkWidget *indicator;
+  GtkWidget *consent;
+  char *owner;
+  char *app_id;
+  guint owner_watch;
+  GHashTable *pressed_keys;
+  GHashTable *pressed_keysyms;
+  GHashTable *pressed_buttons;
+  gpointer pending;
 } ScreenCastSession;
 
 typedef struct _ScreenCastSessionClass
@@ -436,6 +452,35 @@ typedef struct _ScreenCastSessionClass
 static GType screencast_session_get_type (void);
 G_DEFINE_TYPE (ScreenCastSession, screencast_session, session_get_type ())
 
+static gboolean close_session_idle (gpointer user_data);
+static void cancel_pending_start (ScreenCastSession *session);
+static gboolean session_is_unlocked (ScreenCastSession *session);
+static void show_sharing_indicator (ScreenCastSession *session);
+static gboolean remote_desktop_init (GDBusConnection *bus, GError **error);
+static gboolean setup_session (ScreenCastSession *session, GDBusMethodInvocation *invocation,
+                                const char *app_id, GError **error);
+static gboolean session_owned (ScreenCastSession *session, GDBusMethodInvocation *invocation,
+                               const char *app_id);
+static void release_remote_input (ScreenCastSession *session);
+
+static gboolean
+start_remote_session (ScreenCastSession *session, GError **error)
+{
+  g_autoptr(GVariant) reply = NULL;
+  reply = g_dbus_proxy_call_sync (session->remote_proxy, "Start", NULL,
+                                  G_DBUS_CALL_FLAGS_NONE, 5000, NULL, error);
+  return reply != NULL;
+}
+
+static void
+terminate_sharing (ScreenCastSession *session)
+{
+  if (session->parent.closed)
+    return;
+  xdp_impl_session_emit_closed (XDP_IMPL_SESSION (session));
+  session_close ((Session *) session);
+}
+
 static void
 screencast_session_close (Session *session)
 {
@@ -443,6 +488,23 @@ screencast_session_close (Session *session)
   GError *error = NULL;
 
   g_debug ("Closing screencast session");
+
+  cancel_pending_start (screencast_session);
+  if (screencast_session->consent)
+    gtk_dialog_response (GTK_DIALOG (screencast_session->consent), GTK_RESPONSE_CANCEL);
+  if (screencast_session->indicator)
+    {
+      gtk_widget_destroy (screencast_session->indicator);
+      screencast_session->indicator = NULL;
+    }
+  if (screencast_session->remote_proxy)
+    {
+      release_remote_input (screencast_session);
+      g_autoptr(GVariant) reply = NULL;
+      reply = g_dbus_proxy_call_sync (screencast_session->remote_proxy, "Stop",
+                                      NULL, G_DBUS_CALL_FLAGS_NONE, 5000, NULL, NULL);
+      g_clear_object (&screencast_session->remote_proxy);
+    }
 
   if (screencast_session->muffin_session)
     {
@@ -465,6 +527,15 @@ screencast_session_finalize (GObject *object)
   ScreenCastSession *screencast_session = (ScreenCastSession *)object;
 
   g_clear_object (&screencast_session->muffin_session);
+  if (screencast_session->owner_watch)
+    g_bus_unwatch_name (screencast_session->owner_watch);
+  g_clear_object (&screencast_session->locker);
+  g_free (screencast_session->owner);
+  g_free (screencast_session->app_id);
+  g_free (screencast_session->remote_id);
+  g_clear_pointer (&screencast_session->pressed_keys, g_hash_table_unref);
+  g_clear_pointer (&screencast_session->pressed_keysyms, g_hash_table_unref);
+  g_clear_pointer (&screencast_session->pressed_buttons, g_hash_table_unref);
 
   G_OBJECT_CLASS (screencast_session_parent_class)->finalize (object);
 }
@@ -582,7 +653,13 @@ start_operation_complete (StartOperation *op,
     }
 
   op->completed = TRUE;
+  op->session->pending = NULL;
   op->session->start_pending = FALSE;
+  if (response != 0 && !op->session->parent.closed)
+    {
+      xdp_impl_session_emit_closed (XDP_IMPL_SESSION (op->session));
+      g_idle_add (close_session_idle, g_object_ref (op->session));
+    }
 
   if (op->request->exported)
     request_unexport (op->request);
@@ -590,10 +667,8 @@ start_operation_complete (StartOperation *op,
   if (!results)
     results = new_empty_results ();
 
-  xdp_impl_screen_cast_complete_start (op->impl,
-                                       op->invocation,
-                                       response,
-                                       results);
+  g_dbus_method_invocation_return_value (op->invocation,
+                                         g_variant_new ("(u@a{sv})", response, results));
 
   if (op->busy_count > 0)
     {
@@ -602,6 +677,14 @@ start_operation_complete (StartOperation *op,
     }
 
   start_operation_free (op);
+}
+
+static void
+cancel_pending_start (ScreenCastSession *session)
+{
+  StartOperation *op = session->pending;
+  if (op)
+    start_operation_complete (op, 1, NULL);
 }
 
 static void
@@ -685,6 +768,11 @@ on_muffin_session_ready (MuffinScreenCastSession *muffin_session,
 
   if (op->completed)
     return;
+  if (!session_is_unlocked (op->session))
+    {
+      start_operation_fail (op, "The desktop is locked");
+      return;
+    }
 
   g_variant_builder_init (&streams_builder, G_VARIANT_TYPE ("a(ua{sv})"));
   muffin_screen_cast_session_add_stream_properties (muffin_session,
@@ -694,9 +782,13 @@ on_muffin_session_ready (MuffinScreenCastSession *muffin_session,
   g_variant_builder_add (&results_builder, "{sv}",
                          "streams",
                          g_variant_builder_end (&streams_builder));
+  if (op->session->remote)
+    g_variant_builder_add (&results_builder, "{sv}", "devices",
+                           g_variant_new_uint32 (op->session->devices));
   results = g_variant_builder_end (&results_builder);
 
   op->session->started = TRUE;
+  show_sharing_indicator (op->session);
 
   g_signal_connect (muffin_session, "closed",
                     G_CALLBACK (on_muffin_session_closed), op->session);
@@ -715,6 +807,11 @@ start_muffin_session (StartOperation *op,
   guint i;
 
   start_operation_busy_enter (op);
+  if (!session_is_unlocked (op->session))
+    {
+      start_operation_fail (op, "The desktop is locked");
+      goto out;
+    }
 
   selections = g_ptr_array_new_with_free_func (NULL);
   for (i = 0; i < selected_indices->len; i++)
@@ -732,6 +829,7 @@ start_muffin_session (StartOperation *op,
     }
 
   muffin_session = muffin_screen_cast_create_session (muffin_screen_cast,
+                                                      op->session->remote_id,
                                                       &error);
   if (!muffin_session)
     {
@@ -778,7 +876,9 @@ start_muffin_session (StartOperation *op,
         }
     }
 
-  if (!muffin_screen_cast_session_start (muffin_session, &error))
+  if (!(op->session->remote ?
+        start_remote_session (op->session, &error) :
+        muffin_screen_cast_session_start (muffin_session, &error)))
     {
       g_signal_handlers_disconnect_by_data (muffin_session, op);
       muffin_screen_cast_session_abort (muffin_session);
@@ -997,16 +1097,17 @@ handle_start (XdpImplScreenCast *object,
       !G_TYPE_CHECK_INSTANCE_TYPE (session, screencast_session_get_type ()))
     {
       g_warning ("No session found for %s", arg_session_handle);
-      xdp_impl_screen_cast_complete_start (object, invocation, 2,
-                                           new_empty_results ());
+      g_dbus_method_invocation_return_value (invocation,
+                                             g_variant_new ("(u@a{sv})", 2, new_empty_results ()));
       return TRUE;
     }
 
-  if (session->started || session->start_pending)
+  if (!session_owned (session, invocation, arg_app_id) ||
+      (session->remote && !session->remote_proxy) ||
+      session->started || session->start_pending || !session_is_unlocked (session))
     {
-      g_warning ("Session already started");
-      xdp_impl_screen_cast_complete_start (object, invocation, 2,
-                                           new_empty_results ());
+      g_dbus_method_invocation_return_value (invocation,
+                                             g_variant_new ("(u@a{sv})", 2, new_empty_results ()));
       return TRUE;
     }
 
@@ -1018,6 +1119,8 @@ handle_start (XdpImplScreenCast *object,
                              arg_app_id,
                              arg_handle);
   op->items = g_ptr_array_new_with_free_func (picker_item_free);
+  session->start_pending = TRUE;
+  session->pending = op;
 
   if (session->selection.source_types & SCREEN_CAST_SOURCE_TYPE_MONITOR)
     {
@@ -1105,7 +1208,9 @@ handle_select_sources (XdpImplScreenCast *object,
 
   session = (ScreenCastSession *)lookup_session (arg_session_handle);
   if (!session ||
-      !G_TYPE_CHECK_INSTANCE_TYPE (session, screencast_session_get_type ()))
+      !G_TYPE_CHECK_INSTANCE_TYPE (session, screencast_session_get_type ()) ||
+      !session_owned (session, invocation, arg_app_id) ||
+      session->started || session->start_pending)
     {
       g_warning ("No session found for %s", arg_session_handle);
       xdp_impl_screen_cast_complete_select_sources (object, invocation, 2,
@@ -1116,6 +1221,7 @@ handle_select_sources (XdpImplScreenCast *object,
   g_variant_lookup (arg_options, "types", "u", &types);
   g_variant_lookup (arg_options, "multiple", "b", &multiple);
   g_variant_lookup (arg_options, "cursor_mode", "u", &cursor_mode);
+  session->sources_selected = TRUE;
 
   session->selection.multiple = multiple;
   session->selection.cursor_mode = cursor_mode;
@@ -1150,8 +1256,19 @@ handle_create_session (XdpImplScreenCast *object,
   Session *session;
 
   g_debug ("Got new CreateSession request");
+  if (lookup_session (arg_session_handle))
+    {
+      xdp_impl_screen_cast_complete_create_session (object, invocation, 2, new_empty_results ());
+      return TRUE;
+    }
 
   session = (Session *)screencast_session_new (arg_session_handle);
+  if (!setup_session ((ScreenCastSession *) session, invocation, arg_app_id, &error))
+    {
+      g_object_unref (session);
+      xdp_impl_screen_cast_complete_create_session (object, invocation, 2, new_empty_results ());
+      return TRUE;
+    }
 
   if (!session_export (session,
                        g_dbus_method_invocation_get_connection (invocation),
@@ -1216,5 +1333,487 @@ screen_cast_init (GDBusConnection *bus,
 
   g_debug ("providing %s", g_dbus_interface_skeleton_get_info (helper)->name);
 
+  return remote_desktop_init (bus, error);
+}
+
+static gboolean
+session_owned (ScreenCastSession *session, GDBusMethodInvocation *invocation, const char *app_id)
+{
+  return !session->parent.closed &&
+         g_strcmp0 (session->owner, g_dbus_method_invocation_get_sender (invocation)) == 0 &&
+         (!app_id || g_strcmp0 (session->app_id, app_id) == 0);
+}
+
+static gboolean
+session_is_unlocked (ScreenCastSession *session)
+{
+  g_autoptr(GVariant) reply = NULL;
+  g_autofree char *owner = NULL;
+  gboolean active = TRUE;
+  if (!session->locker)
+    return FALSE;
+  owner = g_dbus_proxy_get_name_owner (session->locker);
+  if (!owner)
+    return FALSE;
+  reply = g_dbus_proxy_call_sync (session->locker, "GetActive", NULL,
+                                  G_DBUS_CALL_FLAGS_NONE, 5000, NULL, NULL);
+  if (!reply)
+    return FALSE;
+  g_variant_get (reply, "(b)", &active);
+  session->unlocked = !active;
+  return session->unlocked;
+}
+
+static void
+on_locker_signal (GDBusProxy *proxy, const char *sender, const char *signal,
+                  GVariant *parameters, gpointer data)
+{
+  gboolean active;
+  if (g_str_equal (signal, "ActiveChanged"))
+    {
+      g_variant_get (parameters, "(b)", &active);
+      ((ScreenCastSession *) data)->unlocked = !active;
+      if (active)
+        terminate_sharing (data);
+    }
+}
+
+static void
+on_service_owner_changed (GObject *object, GParamSpec *pspec, gpointer data)
+{
+  g_autofree char *owner = g_dbus_proxy_get_name_owner (G_DBUS_PROXY (object));
+  if (!owner)
+    terminate_sharing (data);
+}
+
+static void
+on_frontend_vanished (GDBusConnection *connection, const char *name, gpointer data)
+{
+  terminate_sharing (data);
+}
+
+static gboolean
+setup_session (ScreenCastSession *session, GDBusMethodInvocation *invocation,
+               const char *app_id, GError **error)
+{
+  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  session->owner = g_strdup (g_dbus_method_invocation_get_sender (invocation));
+  session->app_id = g_strdup (app_id);
+  session->locker = g_dbus_proxy_new_sync (connection, G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
+                                          NULL, "org.cinnamon.ScreenSaver",
+                                          "/org/cinnamon/ScreenSaver", "org.cinnamon.ScreenSaver", NULL, error);
+  if (!session->locker)
+    return FALSE;
+  g_signal_connect (session->locker, "g-signal", G_CALLBACK (on_locker_signal), session);
+  g_signal_connect (session->locker, "notify::g-name-owner", G_CALLBACK (on_service_owner_changed), session);
+  session->owner_watch = g_bus_watch_name_on_connection (connection, session->owner,
+                                                         G_BUS_NAME_WATCHER_FLAGS_NONE, NULL,
+                                                         on_frontend_vanished, session, NULL);
   return TRUE;
+}
+
+static void
+on_stop_sharing (GtkButton *button, gpointer data)
+{
+  terminate_sharing (data);
+}
+
+static gboolean
+on_indicator_delete (GtkWidget *widget, GdkEvent *event, gpointer data)
+{
+  terminate_sharing (data);
+  return TRUE;
+}
+
+static void
+show_sharing_indicator (ScreenCastSession *session)
+{
+  GtkWidget *box, *label, *button;
+  g_autofree char *text = NULL;
+  session->indicator = gtk_window_new (GTK_WINDOW_TOPLEVEL);
+  gtk_window_set_title (GTK_WINDOW (session->indicator), _("Desktop sharing"));
+  gtk_window_set_keep_above (GTK_WINDOW (session->indicator), TRUE);
+  gtk_window_set_resizable (GTK_WINDOW (session->indicator), FALSE);
+  box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_container_set_border_width (GTK_CONTAINER (box), 12);
+  text = g_strdup_printf (session->remote ? _("%s is controlling your desktop") :
+                                            _("%s is sharing your screen"),
+                          session->app_id[0] ? session->app_id : _("An application"));
+  label = gtk_label_new (text);
+  button = gtk_button_new_with_label (_("Stop sharing"));
+  gtk_container_add (GTK_CONTAINER (session->indicator), box);
+  gtk_box_pack_start (GTK_BOX (box), label, TRUE, TRUE, 0);
+  gtk_box_pack_start (GTK_BOX (box), button, FALSE, FALSE, 0);
+  g_signal_connect (button, "clicked", G_CALLBACK (on_stop_sharing), session);
+  g_signal_connect (session->indicator, "delete-event", G_CALLBACK (on_indicator_delete), session);
+  gtk_widget_show_all (session->indicator);
+}
+
+static void
+release_pressed (ScreenCastSession *session, GHashTable *pressed, const char *method, gboolean signed_code)
+{
+  GHashTableIter iter;
+  gpointer key;
+  if (!pressed)
+    return;
+  g_hash_table_iter_init (&iter, pressed);
+  while (g_hash_table_iter_next (&iter, &key, NULL))
+    {
+      GVariant *parameters = signed_code ?
+        g_variant_new ("(ib)", GPOINTER_TO_INT (key), FALSE) :
+        g_variant_new ("(ub)", GPOINTER_TO_UINT (key), FALSE);
+      g_dbus_proxy_call (session->remote_proxy, method, parameters,
+                         G_DBUS_CALL_FLAGS_NONE, 5000, NULL, NULL, NULL);
+    }
+  g_hash_table_remove_all (pressed);
+}
+
+static void
+release_remote_input (ScreenCastSession *session)
+{
+  release_pressed (session, session->pressed_keys, "NotifyKeyboardKeycode", FALSE);
+  release_pressed (session, session->pressed_keysyms, "NotifyKeyboardKeysym", FALSE);
+  release_pressed (session, session->pressed_buttons, "NotifyPointerButton", TRUE);
+}
+
+static void
+on_remote_signal (GDBusProxy *proxy, const char *sender, const char *signal,
+                  GVariant *parameters, gpointer data)
+{
+  if (g_str_equal (signal, "Closed"))
+    terminate_sharing (data);
+}
+
+static gboolean
+create_remote_session (ScreenCastSession *session, GDBusConnection *connection, GError **error)
+{
+  g_autoptr(GVariant) reply = NULL;
+  g_autoptr(GVariant) id = NULL;
+  const char *path;
+  reply = g_dbus_connection_call_sync (connection, "org.cinnamon.Muffin.RemoteDesktop",
+                                       "/org/cinnamon/Muffin/RemoteDesktop",
+                                       "org.cinnamon.Muffin.RemoteDesktop", "CreateSession", NULL,
+                                       G_VARIANT_TYPE ("(o)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL, error);
+  if (!reply)
+    return FALSE;
+  g_variant_get (reply, "(&o)", &path);
+  session->remote_proxy = g_dbus_proxy_new_sync (connection, G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
+                                                NULL, "org.cinnamon.Muffin.RemoteDesktop", path,
+                                                "org.cinnamon.Muffin.RemoteDesktop.Session", NULL, error);
+  if (!session->remote_proxy)
+    return FALSE;
+  id = g_dbus_proxy_get_cached_property (session->remote_proxy, "SessionId");
+  if (!id)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Remote desktop session has no ID");
+      return FALSE;
+    }
+  session->remote_id = g_variant_dup_string (id, NULL);
+  g_signal_connect (session->remote_proxy, "g-signal", G_CALLBACK (on_remote_signal), session);
+  g_signal_connect (session->remote_proxy, "notify::g-name-owner", G_CALLBACK (on_service_owner_changed), session);
+  return TRUE;
+}
+
+typedef struct
+{
+  ScreenCastSession *session;
+  Request *request;
+  GDBusMethodInvocation *invocation;
+  char *handle;
+  char *parent_window;
+  GVariant *options;
+} RemoteConsent;
+
+static void
+remote_result (GDBusMethodInvocation *invocation, guint response, GVariant *results)
+{
+  g_dbus_method_invocation_return_value (invocation,
+                                         g_variant_new ("(u@a{sv})", response,
+                                                        results ? results : new_empty_results ()));
+}
+
+static void
+on_remote_consent (GtkDialog *dialog, gint response, gpointer data)
+{
+  RemoteConsent *consent = data;
+  ScreenCastSession *session = consent->session;
+  g_autoptr(GError) error = NULL;
+  gboolean accepted = response == GTK_RESPONSE_ACCEPT && !session->parent.closed &&
+                      session_is_unlocked (session);
+
+  session->consent = NULL;
+  session->start_pending = FALSE;
+  gtk_widget_destroy (GTK_WIDGET (dialog));
+  if (consent->request->exported)
+    request_unexport (consent->request);
+  if (accepted)
+    accepted = create_remote_session (session,
+                                      g_dbus_method_invocation_get_connection (consent->invocation), &error);
+  if (!accepted)
+    {
+      remote_result (consent->invocation, response == GTK_RESPONSE_ACCEPT ? 2 : 1, NULL);
+      terminate_sharing (session);
+    }
+  else if (session->sources_selected)
+    handle_start (NULL, consent->invocation, consent->handle, session->parent.id,
+                   session->app_id, consent->parent_window, consent->options);
+  else if (start_remote_session (session, &error))
+    {
+      GVariantBuilder results;
+      session->started = TRUE;
+      show_sharing_indicator (session);
+      g_variant_builder_init (&results, G_VARIANT_TYPE_VARDICT);
+      g_variant_builder_add (&results, "{sv}", "devices", g_variant_new_uint32 (session->devices));
+      remote_result (consent->invocation, 0, g_variant_builder_end (&results));
+    }
+  else
+    {
+      remote_result (consent->invocation, 2, NULL);
+      terminate_sharing (session);
+    }
+  g_object_unref (consent->request);
+  g_object_unref (consent->session);
+  g_object_unref (consent->invocation);
+  g_variant_unref (consent->options);
+  g_free (consent->handle);
+  g_free (consent->parent_window);
+  g_free (consent);
+}
+
+static gboolean
+on_remote_request_close (XdpImplRequest *request, GDBusMethodInvocation *invocation, gpointer data)
+{
+  ScreenCastSession *session = data;
+  if (session->consent)
+    gtk_dialog_response (GTK_DIALOG (session->consent), GTK_RESPONSE_CANCEL);
+  return FALSE;
+}
+
+static void
+request_remote_consent (ScreenCastSession *session, GDBusMethodInvocation *invocation,
+                         const char *handle, const char *parent_window, GVariant *options)
+{
+  RemoteConsent *consent = g_new0 (RemoteConsent, 1);
+  const char *devices = session->devices == 3 ? _("keyboard and pointer") :
+                        session->devices == 1 ? _("keyboard") : _("pointer");
+  consent->session = g_object_ref (session);
+  consent->invocation = g_object_ref (invocation);
+  consent->handle = g_strdup (handle);
+  consent->parent_window = g_strdup (parent_window);
+  consent->options = g_variant_ref (options);
+  consent->request = request_new (session->owner, session->app_id, handle);
+  request_export (consent->request, g_dbus_method_invocation_get_connection (invocation));
+  g_signal_connect (consent->request, "handle-close", G_CALLBACK (on_remote_request_close), session);
+  session->start_pending = TRUE;
+  session->consent = gtk_message_dialog_new (NULL, 0, GTK_MESSAGE_WARNING, GTK_BUTTONS_NONE,
+                                             _("Allow %s to control your %s?"),
+                                             session->app_id[0] ? session->app_id : _("an application"), devices);
+  gtk_message_dialog_format_secondary_text (GTK_MESSAGE_DIALOG (session->consent),
+                                             _("Remote input can operate applications as you. "
+                                               "Sharing stops when you lock the screen or choose Stop sharing."));
+  gtk_dialog_add_buttons (GTK_DIALOG (session->consent), _("Cancel"), GTK_RESPONSE_CANCEL,
+                           _("Allow control"), GTK_RESPONSE_ACCEPT, NULL);
+  gtk_dialog_set_default_response (GTK_DIALOG (session->consent), GTK_RESPONSE_CANCEL);
+  g_signal_connect (session->consent, "response", G_CALLBACK (on_remote_consent), consent);
+  gtk_widget_show (session->consent);
+}
+
+static void
+input_finished (GObject *object, GAsyncResult *result, gpointer data)
+{
+  GDBusMethodInvocation *invocation = data;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GVariant) reply = g_dbus_proxy_call_finish (G_DBUS_PROXY (object), result, &error);
+  if (reply)
+    g_dbus_method_invocation_return_value (invocation, NULL);
+  else
+    g_dbus_method_invocation_return_gerror (invocation, error);
+  g_object_unref (invocation);
+}
+
+static void
+remote_method_call (GDBusConnection *connection, const char *sender, const char *path,
+                    const char *interface, const char *method, GVariant *parameters,
+                    GDBusMethodInvocation *invocation, gpointer data)
+{
+  g_autoptr(GVariant) options = NULL;
+  g_autoptr(GError) error = NULL;
+  ScreenCastSession *session;
+  const char *handle, *session_handle, *app_id, *parent_window = NULL;
+  GVariant *forward = NULL;
+  const char *forward_method = method;
+  guint32 state = 0, code = 0, node;
+  gint32 button;
+  double x, y;
+  GHashTable *pressed = NULL;
+
+  if (g_str_equal (method, "CreateSession"))
+    {
+      g_variant_get (parameters, "(&o&o&s@a{sv})", &handle, &session_handle, &app_id, &options);
+      if (lookup_session (session_handle))
+        {
+          remote_result (invocation, 2, NULL);
+          return;
+        }
+      session = screencast_session_new (session_handle);
+      session->remote = TRUE;
+      session->devices = 3;
+      session->pressed_keys = g_hash_table_new (g_direct_hash, g_direct_equal);
+      session->pressed_keysyms = g_hash_table_new (g_direct_hash, g_direct_equal);
+      session->pressed_buttons = g_hash_table_new (g_direct_hash, g_direct_equal);
+      if (!setup_session (session, invocation, app_id, &error) ||
+          !session_export ((Session *) session, connection, &error))
+        {
+          g_object_unref (session);
+          remote_result (invocation, 2, NULL);
+        }
+      else
+        remote_result (invocation, 0, NULL);
+      return;
+    }
+  if (g_str_equal (method, "SelectDevices") || g_str_equal (method, "Start"))
+    {
+      if (g_str_equal (method, "Start"))
+        g_variant_get (parameters, "(&o&o&s&s@a{sv})",
+                       &handle, &session_handle, &app_id, &parent_window, &options);
+      else
+        g_variant_get (parameters, "(&o&o&s@a{sv})", &handle, &session_handle, &app_id, &options);
+      session = (ScreenCastSession *) lookup_session (session_handle);
+      if (!session || !G_TYPE_CHECK_INSTANCE_TYPE (session, screencast_session_get_type ()) ||
+          !session->remote || !session_owned (session, invocation, app_id) ||
+          session->started || session->start_pending)
+        {
+          remote_result (invocation, 2, NULL);
+          return;
+        }
+      if (g_str_equal (method, "SelectDevices"))
+        {
+          guint32 types = 3;
+          g_variant_lookup (options, "types", "u", &types);
+          if (types == 0 || (types & ~3))
+            remote_result (invocation, 2, NULL);
+          else
+            {
+              session->devices = types;
+              remote_result (invocation, 0, NULL);
+            }
+        }
+      else if (!session_is_unlocked (session))
+        remote_result (invocation, 2, NULL);
+      else
+        request_remote_consent (session, invocation, handle, parent_window, options);
+      return;
+    }
+  if (!g_str_has_prefix (method, "Notify"))
+    {
+      g_dbus_method_invocation_return_error (invocation, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                                             "This remote desktop method is not supported");
+      return;
+    }
+  g_variant_get_child (parameters, 0, "&o", &session_handle);
+  session = (ScreenCastSession *) lookup_session (session_handle);
+  if (!session || !G_TYPE_CHECK_INSTANCE_TYPE (session, screencast_session_get_type ()) ||
+      !session->remote || !session_owned (session, invocation, NULL) || !session->started ||
+      !session->remote_proxy || !session->unlocked ||
+      ((g_str_has_prefix (method, "NotifyKeyboard") ? 1 : 2) & session->devices) == 0)
+    goto refused;
+  if (g_str_equal (method, "NotifyKeyboardKeycode") || g_str_equal (method, "NotifyKeyboardKeysym"))
+    {
+      g_variant_get_child (parameters, 2, "i", &button);
+      code = button;
+      g_variant_get_child (parameters, 3, "u", &state);
+      if (state > 1 || button < 0)
+        goto refused;
+      pressed = g_str_equal (method, "NotifyKeyboardKeycode") ? session->pressed_keys : session->pressed_keysyms;
+      forward = g_variant_new ("(ub)", code, state != 0);
+    }
+  else if (g_str_equal (method, "NotifyPointerButton"))
+    {
+      g_variant_get_child (parameters, 2, "i", &button);
+      g_variant_get_child (parameters, 3, "u", &state);
+      if (state > 1)
+        goto refused;
+      code = button;
+      pressed = session->pressed_buttons;
+      forward = g_variant_new ("(ib)", button, state != 0);
+    }
+  else if (g_str_equal (method, "NotifyPointerMotionAbsolute"))
+    {
+      const char *stream;
+      g_variant_get_child (parameters, 2, "u", &node);
+      g_variant_get_child (parameters, 3, "d", &x);
+      g_variant_get_child (parameters, 4, "d", &y);
+      stream = session->muffin_session ?
+        muffin_screen_cast_session_stream_path (session->muffin_session, node) : NULL;
+      if (!stream || !isfinite (x) || !isfinite (y))
+        goto refused;
+      forward = g_variant_new ("(sdd)", stream, x, y);
+    }
+  else if (g_str_equal (method, "NotifyPointerMotion") || g_str_equal (method, "NotifyPointerAxis"))
+    {
+      g_variant_get_child (parameters, 2, "d", &x);
+      g_variant_get_child (parameters, 3, "d", &y);
+      if (!isfinite (x) || !isfinite (y))
+        goto refused;
+      if (g_str_equal (method, "NotifyPointerMotion"))
+        {
+          forward_method = "NotifyPointerMotionRelative";
+          forward = g_variant_new ("(dd)", x, y);
+        }
+      else
+        {
+          gboolean finish = FALSE;
+          options = g_variant_get_child_value (parameters, 1);
+          g_variant_lookup (options, "finish", "b", &finish);
+          forward = g_variant_new ("(ddu)", x, y, finish ? 1 : 0);
+        }
+    }
+  else if (g_str_equal (method, "NotifyPointerAxisDiscrete"))
+    {
+      g_variant_get_child (parameters, 2, "u", &code);
+      g_variant_get_child (parameters, 3, "i", &button);
+      if (code > 1)
+        goto refused;
+      forward = g_variant_new ("(ui)", code, button);
+    }
+  else
+    goto refused;
+  if (pressed)
+    {
+      if (state)
+        g_hash_table_add (pressed, GUINT_TO_POINTER (code));
+      else
+        g_hash_table_remove (pressed, GUINT_TO_POINTER (code));
+    }
+  g_dbus_proxy_call (session->remote_proxy, forward_method, forward,
+                     G_DBUS_CALL_FLAGS_NONE, 5000, NULL, input_finished, g_object_ref (invocation));
+  return;
+refused:
+  g_dbus_method_invocation_return_error (invocation, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
+                                         "Remote input is not authorized for this session");
+}
+
+static GVariant *
+remote_get_property (GDBusConnection *connection, const char *sender, const char *path,
+                      const char *interface, const char *property, GError **error, gpointer data)
+{
+  if (g_str_equal (property, "version"))
+    return g_variant_new_uint32 (1);
+  if (g_str_equal (property, "AvailableDeviceTypes"))
+    return g_variant_new_uint32 (3);
+  g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Unknown property");
+  return NULL;
+}
+
+static gboolean
+remote_desktop_init (GDBusConnection *bus, GError **error)
+{
+  static const GDBusInterfaceVTable vtable = {
+    .method_call = remote_method_call,
+    .get_property = remote_get_property,
+  };
+  g_autoptr(XdpImplRemoteDesktop) helper = xdp_impl_remote_desktop_skeleton_new ();
+  return g_dbus_connection_register_object (bus, DESKTOP_PORTAL_OBJECT_PATH,
+                                             g_dbus_interface_skeleton_get_info (G_DBUS_INTERFACE_SKELETON (helper)),
+                                             &vtable, NULL, NULL, error) != 0;
 }
