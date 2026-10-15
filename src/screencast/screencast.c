@@ -876,8 +876,8 @@ start_muffin_session (StartOperation *op,
         {
           g_signal_handlers_disconnect_by_data (muffin_session, op);
           muffin_screen_cast_session_abort (muffin_session);
-          g_clear_pointer ((GObject **) &op->muffin_session, g_object_unref);
-          g_clear_pointer ((GObject **) &op->session->muffin_session, g_object_unref);
+          g_clear_object (&op->muffin_session);
+          g_clear_object (&op->session->muffin_session);
           start_operation_fail (op, error->message);
           goto out;
         }
@@ -889,8 +889,8 @@ start_muffin_session (StartOperation *op,
     {
       g_signal_handlers_disconnect_by_data (muffin_session, op);
       muffin_screen_cast_session_abort (muffin_session);
-      g_clear_pointer ((GObject **) &op->muffin_session, g_object_unref);
-      g_clear_pointer ((GObject **) &op->session->muffin_session, g_object_unref);
+      g_clear_object (&op->muffin_session);
+      g_clear_object (&op->session->muffin_session);
       start_operation_fail (op, error->message);
       goto out;
     }
