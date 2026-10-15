@@ -16,9 +16,12 @@ The Mint packaging currently disables that build option.
 Every control session requires a local confirmation describing the requested
 keyboard and pointer access. Sharing sources are selected separately. A
 visible Stop sharing window remains while a session is active. Closing that
-window, locking/blanking the screen, losing the screensaver/compositor, closing
-the portal session or losing the portal frontend ends sharing. Pressed remote
-keys and buttons are released before the compositor session is stopped.
+window, locking/leaving the graphical session, losing logind/the compositor,
+closing the portal session or losing the portal frontend ends sharing.
+Pressed remote keys and buttons are released before the compositor session
+is stopped. The screensaver must report `LockedHint` through logind; missing
+lock state fails closed. Logind owns the lock monitor, not the normally
+short-lived screensaver process.
 
 Sessions are bound to the creating frontend connection and application ID.
 Remote input is accepted only after consent and successful startup, only for

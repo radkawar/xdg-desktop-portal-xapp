@@ -18,6 +18,7 @@
 
 
 #include <math.h>
+#include <unistd.h>
 
 #include <gio/gio.h>
 #include <glib/gi18n.h>
@@ -1347,20 +1348,18 @@ session_owned (ScreenCastSession *session, GDBusMethodInvocation *invocation, co
 static gboolean
 session_is_unlocked (ScreenCastSession *session)
 {
-  g_autoptr(GVariant) reply = NULL;
+  g_autoptr(GVariant) active = NULL;
+  g_autoptr(GVariant) locked = NULL;
   g_autofree char *owner = NULL;
-  gboolean active = TRUE;
   if (!session->locker)
     return FALSE;
   owner = g_dbus_proxy_get_name_owner (session->locker);
   if (!owner)
     return FALSE;
-  reply = g_dbus_proxy_call_sync (session->locker, "GetActive", NULL,
-                                  G_DBUS_CALL_FLAGS_NONE, 5000, NULL, NULL);
-  if (!reply)
-    return FALSE;
-  g_variant_get (reply, "(b)", &active);
-  session->unlocked = !active;
+  active = g_dbus_proxy_get_cached_property (session->locker, "Active");
+  locked = g_dbus_proxy_get_cached_property (session->locker, "LockedHint");
+  session->unlocked = active && locked &&
+                      g_variant_get_boolean (active) && !g_variant_get_boolean (locked);
   return session->unlocked;
 }
 
@@ -1368,14 +1367,19 @@ static void
 on_locker_signal (GDBusProxy *proxy, const char *sender, const char *signal,
                   GVariant *parameters, gpointer data)
 {
-  gboolean active;
-  if (g_str_equal (signal, "ActiveChanged"))
+  if (g_str_equal (signal, "Lock"))
     {
-      g_variant_get (parameters, "(b)", &active);
-      ((ScreenCastSession *) data)->unlocked = !active;
-      if (active)
-        terminate_sharing (data);
+      ((ScreenCastSession *) data)->unlocked = FALSE;
+      terminate_sharing (data);
     }
+}
+
+static void
+on_lock_properties_changed (GDBusProxy *proxy, GVariant *changed, const char * const *invalidated,
+                            gpointer data)
+{
+  if (!session_is_unlocked (data))
+    terminate_sharing (data);
 }
 
 static void
@@ -1397,14 +1401,44 @@ setup_session (ScreenCastSession *session, GDBusMethodInvocation *invocation,
                const char *app_id, GError **error)
 {
   GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  g_autoptr(GDBusConnection) system_bus = NULL;
+  g_autoptr(GDBusProxy) user = NULL;
+  g_autoptr(GVariant) reply = NULL;
+  g_autoptr(GVariant) display = NULL;
+  const char *user_path, *session_id, *session_path;
   session->owner = g_strdup (g_dbus_method_invocation_get_sender (invocation));
   session->app_id = g_strdup (app_id);
-  session->locker = g_dbus_proxy_new_sync (connection, G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
-                                          NULL, "org.cinnamon.ScreenSaver",
-                                          "/org/cinnamon/ScreenSaver", "org.cinnamon.ScreenSaver", NULL, error);
+  system_bus = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, error);
+  if (!system_bus)
+    return FALSE;
+  reply = g_dbus_connection_call_sync (system_bus, "org.freedesktop.login1",
+                                       "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                                       "GetUser", g_variant_new ("(u)", (guint32) getuid ()),
+                                       G_VARIANT_TYPE ("(o)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL, error);
+  if (!reply)
+    return FALSE;
+  g_variant_get (reply, "(&o)", &user_path);
+  user = g_dbus_proxy_new_sync (system_bus, G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START, NULL,
+                                "org.freedesktop.login1", user_path, "org.freedesktop.login1.User",
+                                NULL, error);
+  if (!user)
+    return FALSE;
+  display = g_dbus_proxy_get_cached_property (user, "Display");
+  if (!display)
+    return FALSE;
+  g_variant_get (display, "(&s&o)", &session_id, &session_path);
+  if (!session_id[0])
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "No graphical login session");
+      return FALSE;
+    }
+  session->locker = g_dbus_proxy_new_sync (system_bus, G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START, NULL,
+                                          "org.freedesktop.login1", session_path,
+                                          "org.freedesktop.login1.Session", NULL, error);
   if (!session->locker)
     return FALSE;
   g_signal_connect (session->locker, "g-signal", G_CALLBACK (on_locker_signal), session);
+  g_signal_connect (session->locker, "g-properties-changed", G_CALLBACK (on_lock_properties_changed), session);
   g_signal_connect (session->locker, "notify::g-name-owner", G_CALLBACK (on_service_owner_changed), session);
   session->owner_watch = g_bus_watch_name_on_connection (connection, session->owner,
                                                          G_BUS_NAME_WATCHER_FLAGS_NONE, NULL,
