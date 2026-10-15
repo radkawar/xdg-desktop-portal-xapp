@@ -45,7 +45,8 @@ session = None
 pipeline = None
 pipewire_fd = None
 closed = []
-released = {'shift': 0, 'button': 0}
+released = {'shift': 0, 'button': 0, 'keysym': 0}
+held_keysym = 0x0101F4A1  # U+1F4A1 exercises a dynamically reserved XKB mapping.
 scrolls = []
 status = 1
 
@@ -130,7 +131,9 @@ area.connect('draw', lambda widget, cr: (cr.set_source_rgb(0.1, 0.65, 0.2), cr.p
 area.connect('button-release-event', lambda widget, event: released.update(button=released['button'] + 1))
 area.connect('scroll-event', lambda widget, event: scrolls.append(int(event.direction)))
 box.pack_start(area, True, True, 0)
-window.connect('key-release-event', lambda widget, event: released.update(shift=released['shift'] + (event.keyval == Gdk.KEY_Shift_L)))
+window.connect('key-release-event', lambda widget, event: released.update(
+    shift=released['shift'] + (event.keyval == Gdk.KEY_Shift_L),
+    keysym=released['keysym'] + (event.keyval == held_keysym)))
 window.show_all()
 
 
@@ -224,6 +227,9 @@ def run():
         record('native-control-verified', keyboard=entry.get_text(), clicks=released['button'],
                scrolls=scrolls, lifetime_seconds=35)
         before = dict(released)
+        notify('NotifyKeyboardKeysym', 'iu', held_keysym, 1)
+        spin(200)
+        assert entry.get_text().endswith('\U0001f4a1'), 'Reserved keysym did not reach native GTK'
         notify('NotifyKeyboardKeycode', 'iu', 42, 1)  # Leave Shift held until teardown.
         notify('NotifyPointerButton', 'iu', 272, 1)
         spin(200)
@@ -257,6 +263,7 @@ def run():
         if not args.lock:
             assert released['shift'] > before['shift'], 'Held Shift was not released'
             assert released['button'] > before['button'], 'Held pointer button was not released'
+            assert released['keysym'] > before['keysym'], 'Held reserved keysym was not released'
         try:
             notify('NotifyKeyboardKeysym', 'iu', ord('x'), 1)
         except GLib.Error:
