@@ -1432,7 +1432,9 @@ setup_session (ScreenCastSession *session, GDBusMethodInvocation *invocation,
       g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED, "No graphical login session");
       return FALSE;
     }
-  session->locker = g_dbus_proxy_new_sync (system_bus, G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START, NULL,
+  session->locker = g_dbus_proxy_new_sync (system_bus,
+                                          G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START |
+                                          G_DBUS_PROXY_FLAGS_GET_INVALIDATED_PROPERTIES, NULL,
                                           "org.freedesktop.login1", session_path,
                                           "org.freedesktop.login1.Session", NULL, error);
   if (!session->locker)

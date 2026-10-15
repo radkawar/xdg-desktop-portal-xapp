@@ -1,5 +1,7 @@
 usr/lib/systemd/user/xdg-desktop-portal-xapp.service
+usr/lib/systemd/user/xdg-desktop-portal.service.d/50-lindm-native-selection.conf
 usr/libexec/xdg-desktop-portal-xapp
 usr/share/applications/xdg-desktop-portal-xapp.desktop
 usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.xapp.service
 usr/share/xdg-desktop-portal/portals
+usr/share/xdg-desktop-portal/x-cinnamon-portals.conf

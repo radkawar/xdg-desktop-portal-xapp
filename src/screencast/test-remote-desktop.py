@@ -38,6 +38,7 @@ pipeline = None
 pipewire_fd = None
 closed = []
 released = {'shift': 0, 'button': 0}
+scrolls = []
 status = 1
 
 
@@ -115,9 +116,11 @@ entry = Gtk.Entry()
 entry.set_placeholder_text('Remote keyboard nonce appears here')
 box.pack_start(entry, False, False, 0)
 area = Gtk.DrawingArea()
-area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
 area.connect('draw', lambda widget, cr: (cr.set_source_rgb(0.1, 0.65, 0.2), cr.paint(), False)[2])
 area.connect('button-release-event', lambda widget, event: released.update(button=released['button'] + 1))
+area.connect('scroll-event', lambda widget, event: scrolls.append(int(event.direction)))
 box.pack_start(area, True, True, 0)
 window.connect('key-release-event', lambda widget, event: released.update(shift=released['shift'] + (event.keyval == Gdk.KEY_Shift_L)))
 window.show_all()
@@ -175,9 +178,23 @@ def run():
         notify('NotifyPointerButton', 'iu', 272, 0)
         spin(300)
         assert released['button'] > 0, 'Remote click did not reach the native witness'
+        notify('NotifyPointerMotion', 'dd', 7.0, -5.0)
+        spin(100)
+        pointer = Gdk.Display.get_default().get_default_seat().get_pointer()
+        position = pointer.get_position()
+        assert position[-2] > x and position[-1] < y, 'Relative pointer motion did not reach X11'
+        before_scroll = len(scrolls)
+        notify('NotifyPointerAxisDiscrete', 'ui', 0, 1)
+        spin(200)
+        assert len(scrolls) > before_scroll, 'Discrete wheel did not reach the native witness'
+        before_scroll = len(scrolls)
+        notify('NotifyPointerAxis', 'dd', 0.0, 12.0)
+        spin(200)
+        assert len(scrolls) > before_scroll, 'Smooth wheel did not reach the native witness'
         second = sample_hash()
         assert first != second, 'Captured frames did not reflect the changed desktop'
-        record('native-control-verified', keyboard=entry.get_text(), clicks=released['button'], lifetime_seconds=35)
+        record('native-control-verified', keyboard=entry.get_text(), clicks=released['button'],
+               scrolls=scrolls, lifetime_seconds=35)
         before = dict(released)
         notify('NotifyKeyboardKeycode', 'iu', 42, 1)  # Leave Shift held until teardown.
         notify('NotifyPointerButton', 'iu', 272, 1)

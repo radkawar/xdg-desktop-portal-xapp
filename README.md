@@ -36,3 +36,10 @@ checks real GTK keyboard/pointer delivery after 35 seconds, and checks held
 input release and rejection after closing the session. Repeat with `--decline`,
 `--cancel`, `--stop`, and `--lock` for the local refusal and teardown paths.
 The test requires PyGObject, GTK 3, GStreamer and `gstreamer1.0-pipewire`.
+
+The fork-only native package also installs a standard Cinnamon `portals.conf`
+selecting this backend and a frontend systemd drop-in limiting portal search
+homes/directories to root-controlled `/etc/xdg` and `/usr/share`. This lets the
+separately qualified client prove the selected implementation, not merely find
+an unrelated running backend. It intentionally excludes per-user portal
+overrides; it is not part of the rejected upstream ScreenCast pull request.

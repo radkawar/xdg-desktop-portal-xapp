@@ -6,6 +6,14 @@ install_data(
   [ 'xapp.portal', 'xapp-screencast.portal', 'xapp-gnome-keyring.portal' ],
   install_dir: datadir / 'xdg-desktop-portal' / 'portals'
 )
+install_data(
+  'x-cinnamon-portals.conf',
+  install_dir: datadir / 'xdg-desktop-portal'
+)
+install_data(
+  '50-lindm-native-selection.conf',
+  install_dir: systemduserunitdir / 'xdg-desktop-portal.service.d'
+)
 
 # dbus service
 service_name = 'org.freedesktop.impl.portal.desktop.xapp'
